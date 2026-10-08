@@ -10,3 +10,5 @@ build/
 *.mp4
 .env
 .env.local
+outputs/
+work/

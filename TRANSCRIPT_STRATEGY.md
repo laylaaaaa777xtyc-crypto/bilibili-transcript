@@ -11,21 +11,27 @@
 ## 典型命令
 
 ```bash
-# 默认：字幕优先
-python -m bilibili_transcript "BV1xxxxxxxxx" -o case_outputs/BV1xxxxxxxxx
+# 默认：字幕优先，输出到 outputs/<BV号>/
+bili "BV1xxxxxxxxx"
+
+# 从缓存生成规则化可读文稿
+bili "BV1xxxxxxxxx" --article
+
+# 忽略缓存重新获取
+bili "BV1xxxxxxxxx" --refresh
 
 # 登录态字幕
-python -m bilibili_transcript "BV1xxxxxxxxx" -o case_outputs/BV1xxxxxxxxx \
+bili "BV1xxxxxxxxx" \
   --cookies-from-browser chrome
 
 # 强制 ASR
-python -m bilibili_transcript "BV1xxxxxxxxx" -o out --force-asr
+bili "BV1xxxxxxxxx" --output out --force-asr
 
 # 仅 JSON
-python -m bilibili_transcript "BV1xxxxxxxxx" -o out --json-only
+bili "BV1xxxxxxxxx" --output out --json-only
 
 # 导出 HTML
-python -m bilibili_transcript export-html case_outputs/BV1xxxxxxxxx/
+bili export-html case_outputs/BV1xxxxxxxxx/
 ```
 
 ## JSON 中的 `part_sources`

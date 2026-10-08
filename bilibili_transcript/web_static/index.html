@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d1017">
+  <title>BiliScribe · B站视频转可读文稿</title>
+  <meta name="description" content="把 Bilibili 视频转换成可靠、清晰、可下载的本地文稿。">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="BiliScribe 首页">
+      <span class="brand-mark">B</span>
+      <span class="brand-copy"><strong>BiliScribe</strong><small>LOCAL TRANSCRIPT STUDIO</small></span>
+    </a>
+    <div class="topbar-actions">
+      <span class="local-badge"><span class="pulse-dot"></span>仅在本机运行</span>
+      <a class="ghost-link" href="/api/docs" target="_blank" rel="noreferrer">API 文档</a>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="control-column">
+      <section class="input-card panel">
+        <div class="eyebrow">NEW TRANSCRIPT</div>
+        <h1>从视频到文稿，<br><span>一步完成。</span></h1>
+        <p class="intro">粘贴 Bilibili 链接。优先获取可靠字幕，必要时自动启动本地 Whisper。</p>
+
+        <form id="job-form">
+          <label for="video-url">视频链接或 BV 号</label>
+          <div class="url-field">
+            <textarea id="video-url" name="url" rows="3" placeholder="https://www.bilibili.com/video/BV..." required spellcheck="false"></textarea>
+            <button class="paste-button" id="paste-button" type="button">粘贴</button>
+          </div>
+
+          <details class="options" open>
+            <summary>处理选项 <span>按需调整</span></summary>
+            <div class="option-grid">
+              <label class="select-field">
+                <span>Whisper 模型</span>
+                <select id="model" name="model">
+                  <option value="small" selected>Small · 推荐</option>
+                  <option value="medium">Medium · 更准确</option>
+                  <option value="large-v3">Large v3 · 更准确</option>
+                  <option value="base">Base · 轻量</option>
+                  <option value="tiny">Tiny · 最快</option>
+                </select>
+              </label>
+              <label class="select-field">
+                <span>运行设备</span>
+                <select id="device" name="device">
+                  <option value="auto" selected>自动选择</option>
+                  <option value="cpu">CPU</option>
+                  <option value="cuda">CUDA</option>
+                </select>
+              </label>
+              <label class="select-field full">
+                <span>浏览器 Cookie（可选）</span>
+                <select id="cookies" name="cookies">
+                  <option value="">不读取</option>
+                  <option value="chrome">Chrome</option>
+                  <option value="safari">Safari</option>
+                  <option value="edge">Edge</option>
+                  <option value="firefox">Firefox</option>
+                  <option value="brave">Brave</option>
+                </select>
+              </label>
+            </div>
+            <div class="toggle-list">
+              <label class="toggle-row">
+                <span><strong>生成可读文稿</strong><small>输出 article.md</small></span>
+                <input id="article" type="checkbox" checked><i></i>
+              </label>
+              <label class="toggle-row">
+                <span><strong>强制语音识别</strong><small>跳过官方字幕</small></span>
+                <input id="force-asr" type="checkbox"><i></i>
+              </label>
+              <label class="toggle-row">
+                <span><strong>忽略已有缓存</strong><small>重新获取字幕或识别</small></span>
+                <input id="refresh" type="checkbox"><i></i>
+              </label>
+            </div>
+          </details>
+
+          <button class="primary-button" id="submit-button" type="submit">
+            <span>开始生成文稿</span><b>→</b>
+          </button>
+          <p class="privacy-note">视频与文稿不会上传到第三方服务</p>
+        </form>
+      </section>
+
+      <section class="history-card panel">
+        <div class="section-heading">
+          <div><span class="eyebrow">LIBRARY</span><h2>最近文稿</h2></div>
+          <button id="refresh-history" class="icon-button" type="button" aria-label="刷新文稿列表">↻</button>
+        </div>
+        <div id="history-list" class="history-list" aria-live="polite">
+          <div class="history-skeleton"></div><div class="history-skeleton short"></div>
+        </div>
+      </section>
+    </aside>
+
+    <section class="content-column">
+      <div id="empty-state" class="empty-state panel">
+        <div class="empty-visual" aria-hidden="true">
+          <div class="wave wave-a"></div><div class="wave wave-b"></div><div class="wave wave-c"></div>
+          <span class="play-symbol">▶</span>
+        </div>
+        <div class="empty-copy">
+          <span class="eyebrow">READY WHEN YOU ARE</span>
+          <h2>让视频内容真正可读、可搜索、可复用。</h2>
+          <p>生成逐字稿、纯文本、SRT 字幕和自然分段的 Markdown 文稿。原始转写始终保留，不被覆盖。</p>
+          <div class="feature-row">
+            <span>字幕优先</span><span>质量检测</span><span>本地 ASR</span><span>自动缓存</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="progress-state" class="progress-card panel hidden" aria-live="polite">
+        <div class="progress-head">
+          <div>
+            <span class="eyebrow">PROCESSING</span>
+            <h2 id="progress-title">正在准备任务</h2>
+            <p id="progress-video-id">—</p>
+          </div>
+          <div class="orbit-loader"><span></span></div>
+        </div>
+        <div class="progress-track"><span id="progress-bar"></span></div>
+        <ol class="step-list">
+          <li id="step-submit" class="active"><i>1</i><span>解析视频</span></li>
+          <li id="step-source"><i>2</i><span>获取字幕 / ASR</span></li>
+          <li id="step-save"><i>3</i><span>生成文稿</span></li>
+          <li id="step-done"><i>4</i><span>保存结果</span></li>
+        </ol>
+        <details class="log-panel">
+          <summary>查看运行日志</summary>
+          <pre id="job-logs">等待输出…</pre>
+        </details>
+        <div id="failure-box" class="failure-box hidden">
+          <strong>本次处理没有完成</strong>
+          <p id="failure-message"></p>
+          <div><button id="retry-job" type="button">使用相同设置重试</button><button id="edit-job" type="button">返回修改设置</button></div>
+        </div>
+      </div>
+
+      <div id="result-state" class="result-card panel hidden">
+        <div class="result-header">
+          <div class="success-mark">✓</div>
+          <div class="result-title-wrap">
+            <span class="eyebrow" id="result-kicker">TRANSCRIPT READY</span>
+            <h2 id="result-title">文稿标题</h2>
+            <div class="result-meta"><span id="result-id"></span><span id="result-source"></span><span id="result-segments"></span></div>
+          </div>
+          <button class="secondary-button" id="new-task" type="button">新建任务</button>
+        </div>
+
+        <div class="result-toolbar">
+          <div class="tabs" role="tablist">
+            <button class="tab active" type="button" data-tab="preview">文稿预览</button>
+            <button class="tab" type="button" data-tab="files">全部文件</button>
+            <button class="tab" type="button" data-tab="logs">运行日志</button>
+          </div>
+          <button class="copy-button" id="copy-result" type="button">复制正文</button>
+        </div>
+
+        <div id="tab-preview" class="tab-panel active">
+          <article id="article-preview" class="article-preview"></article>
+        </div>
+        <div id="tab-files" class="tab-panel">
+          <div id="file-grid" class="file-grid"></div>
+        </div>
+        <div id="tab-logs" class="tab-panel">
+          <pre id="result-logs" class="result-logs">暂无运行日志</pre>
+        </div>
+      </div>
+
+      <footer class="app-footer"><span>BiliScribe 0.4</span><span>字幕事实源与可读文稿分离</span></footer>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -20,6 +20,7 @@ from bilibili_transcript.subtitles import (
     try_fetch_official_segments,
     try_fetch_subtitles_ytdlp,
 )
+from bilibili_transcript.validation import BasicSubtitleValidator
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,10 @@ class BilibiliProvider(TranscriptProvider):
         return extract_bvid(url_or_id)
 
     def fetch_metadata(self, video_id: str, **kwargs: Any) -> VideoMeta:
-        pages = fetch_pagelist(video_id)
         meta = fetch_video_meta(video_id)
+        pages = meta.get("pages") or []
+        if not pages:
+            pages = fetch_pagelist(video_id)
         title = meta.get("title") or video_id
         aid = int(meta.get("aid") or 0)
         return VideoMeta(
@@ -55,30 +58,58 @@ class BilibiliProvider(TranscriptProvider):
         *,
         args: argparse.Namespace,
     ) -> Optional[Tuple[Segments, str, SourceRecord]]:
-        if args.force_asr or not args.prefer_subtitles:
+        if getattr(args, "force_asr", False) or not getattr(args, "prefer_subtitles", True):
             return None
 
         page_url = video_page_url_part(meta.video_id, part_index)
+        duration = 0.0
+        if 0 < part_index <= len(meta.pages):
+            duration = float(meta.pages[part_index - 1].get("duration") or 0.0)
+        validator = BasicSubtitleValidator()
 
-        off = try_fetch_official_segments(
-            meta.video_id, cid, meta.aid,
-            cookies_from_browser=args.cookies_from_browser,
-        )
+        cookies_from_browser = getattr(args, "cookies_from_browser", None)
+        off = None
+        if meta.aid:
+            try:
+                off = try_fetch_official_segments(
+                    meta.video_id,
+                    cid,
+                    meta.aid,
+                    cookies_from_browser=cookies_from_browser,
+                )
+            except Exception as exc:
+                logger.warning("官方字幕获取失败：%s，将继续 fallback。", exc)
+        else:
+            logger.warning("元数据中缺少 aid，跳过官方字幕并继续 fallback。")
         if off:
             segs, full, track_meta = off
-            return segs, full, SourceRecord(
-                part=part_index,
-                mode="official_cc",
-                extra={"lan": track_meta.get("lan"), "subtitle_url": track_meta.get("subtitle_url")},
-            )
+            validation = validator.validate(segs, duration)
+            if validation.valid:
+                return segs, full, SourceRecord(
+                    part=part_index,
+                    mode="official_cc",
+                    extra={
+                        "lan": track_meta.get("lan"),
+                        "subtitle_url": track_meta.get("subtitle_url"),
+                        "validation": validation.to_dict(),
+                    },
+                )
+            logger.warning("官方字幕可靠性检测未通过：%s，将继续 fallback。", validation.reason)
 
-        if args.cookies_from_browser or args.ytdlp_subs:
+        if cookies_from_browser or getattr(args, "ytdlp_subs", False):
             yd = try_fetch_subtitles_ytdlp(
-                page_url, cookies_from_browser=args.cookies_from_browser,
+                page_url, cookies_from_browser=cookies_from_browser,
             )
             if yd:
                 segs, full = yd
-                return segs, full, SourceRecord(part=part_index, mode="ytdlp_subtitle_file")
+                validation = validator.validate(segs, duration)
+                if validation.valid:
+                    return segs, full, SourceRecord(
+                        part=part_index,
+                        mode="ytdlp_subtitle_file",
+                        extra={"validation": validation.to_dict()},
+                    )
+                logger.warning("yt-dlp 字幕可靠性检测未通过：%s，将回退 ASR。", validation.reason)
 
         return None
 
@@ -96,6 +127,6 @@ class BilibiliProvider(TranscriptProvider):
             page=part_index,
             cid=cid,
             out_dir=out_dir,
-            prefer_ytdlp=args.ytdlp,
-            cookies_from_browser=args.cookies_from_browser,
+            prefer_ytdlp=getattr(args, "ytdlp", False),
+            cookies_from_browser=getattr(args, "cookies_from_browser", None),
         )

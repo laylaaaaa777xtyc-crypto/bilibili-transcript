@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -21,6 +23,7 @@ DEFAULT_UA = (
 
 PAGELIST_URL = "https://api.bilibili.com/x/player/pagelist"
 PLAYURL_URL = "https://api.bilibili.com/x/player/playurl"
+_CONTENT_RANGE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)", re.IGNORECASE)
 
 
 def _session_headers(bvid: str) -> Dict[str, str]:
@@ -48,23 +51,30 @@ def fetch_pagelist(bvid: str, timeout: float = 30.0) -> List[Dict[str, Any]]:
     return pages
 
 
-def _pick_audio_url(playurl_json: Dict[str, Any]) -> Optional[str]:
+def _pick_audio_urls(playurl_json: Dict[str, Any]) -> List[str]:
     d = playurl_json.get("data") or {}
     dash = d.get("dash")
     if not dash:
-        return None
+        return []
     audios = dash.get("audio") or []
     if not audios:
-        return None
+        return []
     # Prefer highest bandwidth
     audios = sorted(audios, key=lambda x: int(x.get("bandwidth") or 0), reverse=True)
-    base = audios[0].get("baseUrl") or audios[0].get("base_url")
+    selected = audios[0]
+    urls: List[str] = []
+    base = selected.get("baseUrl") or selected.get("base_url")
     if base:
-        return base
-    backups = audios[0].get("backupUrl") or audios[0].get("backup_url") or []
-    if backups:
-        return backups[0]
-    return None
+        urls.append(base)
+    backups = selected.get("backupUrl") or selected.get("backup_url") or []
+    urls.extend(url for url in backups if url and url not in urls)
+    return urls
+
+
+def _pick_audio_url(playurl_json: Dict[str, Any]) -> Optional[str]:
+    """Backward-compatible single URL selector."""
+    urls = _pick_audio_urls(playurl_json)
+    return urls[0] if urls else None
 
 
 def fetch_playurl(
@@ -100,19 +110,98 @@ def fetch_playurl(
     return last or {}, None
 
 
-def download_url_to_file(url: str, dest: Path, bvid: str, timeout: float = 600.0) -> None:
+def download_url_to_file(
+    url: str,
+    dest: Path,
+    bvid: str,
+    timeout: float = 600.0,
+    max_attempts: int = 6,
+    chunk_bytes: int = 8 * 1024 * 1024,
+) -> None:
+    """Download large media in validated HTTP Range chunks.
+
+    A chunk is kept in memory and appended only after its Content-Range and
+    byte count are verified. A broken connection therefore cannot corrupt the
+    completed prefix on disk.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(
-        url,
-        headers=_session_headers(bvid),
-        stream=True,
-        timeout=timeout,
-    ) as resp:
-        resp.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
+    probe_headers = _session_headers(bvid)
+    probe_headers["Range"] = "bytes=0-0"
+    with requests.get(url, headers=probe_headers, stream=True, timeout=timeout) as probe:
+        probe.raise_for_status()
+        match = _CONTENT_RANGE.fullmatch(probe.headers.get("Content-Range", "").strip())
+        if probe.status_code != 206 or not match:
+            raise RuntimeError("audio CDN does not support validated byte ranges")
+        total_size = int(match.group(3))
+
+    offset = dest.stat().st_size if dest.exists() else 0
+    if offset > total_size:
+        with open(dest, "wb"):
+            pass
+        offset = 0
+    if offset == total_size:
+        return
+    if offset:
+        logger.info("Resuming validated audio download at %.1f MB…", offset / 1024 / 1024)
+
+    while offset < total_size:
+        end = min(offset + chunk_bytes - 1, total_size - 1)
+        expected_length = end - offset + 1
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            headers = _session_headers(bvid)
+            headers["Range"] = f"bytes={offset}-{end}"
+            try:
+                with requests.get(
+                    url,
+                    headers=headers,
+                    stream=True,
+                    timeout=timeout,
+                ) as response:
+                    response.raise_for_status()
+                    content_range = _CONTENT_RANGE.fullmatch(
+                        response.headers.get("Content-Range", "").strip()
+                    )
+                    if response.status_code != 206 or not content_range:
+                        raise IOError("audio CDN returned an unvalidated range response")
+                    actual_start, actual_end, actual_total = map(int, content_range.groups())
+                    if (actual_start, actual_end, actual_total) != (offset, end, total_size):
+                        raise IOError(
+                            "audio CDN returned wrong range "
+                            f"{actual_start}-{actual_end}/{actual_total}; "
+                            f"expected {offset}-{end}/{total_size}"
+                        )
+                    buffer = bytearray()
+                    for chunk in response.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            buffer.extend(chunk)
+                if len(buffer) != expected_length:
+                    raise IOError(
+                        f"incomplete audio chunk: {len(buffer)}/{expected_length} bytes"
+                    )
+                with open(dest, "ab") as file_handle:
+                    file_handle.write(buffer)
+                offset = end + 1
+                break
+            except (requests.RequestException, OSError) as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+                logger.warning(
+                    "Audio chunk %.1f-%.1f MB interrupted (%s); retrying %s/%s…",
+                    offset / 1024 / 1024,
+                    (end + 1) / 1024 / 1024,
+                    exc,
+                    attempt + 1,
+                    max_attempts,
+                )
+                time.sleep(min(2 ** (attempt - 1), 4))
+        else:
+            continue
+        if offset <= end:
+            raise RuntimeError(
+                f"audio chunk download failed after {max_attempts} attempts: {last_error}"
+            )
 
 
 def transcode_to_mp3(src: Path, dst: Path, bitrate: str = "192k") -> None:
@@ -138,7 +227,7 @@ def download_audio_via_api(
     basename: str,
     bitrate: str = "192k",
 ) -> Path:
-    _, audio_url = fetch_playurl(bvid, cid)
+    playurl_json, audio_url = fetch_playurl(bvid, cid)
     if not audio_url:
         raise RuntimeError("playurl did not return DASH audio URL")
 
@@ -147,7 +236,16 @@ def download_audio_via_api(
     mp3_path = work_dir / f"{basename}.mp3"
 
     logger.info("Downloading audio from DASH…")
-    download_url_to_file(audio_url, raw_path, bvid)
+    download_errors: List[str] = []
+    for candidate_url in _pick_audio_urls(playurl_json) or [audio_url]:
+        try:
+            download_url_to_file(candidate_url, raw_path, bvid)
+            break
+        except Exception as exc:
+            download_errors.append(str(exc))
+            logger.warning("Audio CDN failed (%s); trying next source if available…", exc)
+    else:
+        raise RuntimeError("all DASH audio sources failed: " + " | ".join(download_errors))
     logger.info("Transcoding to MP3…")
     transcode_to_mp3(raw_path, mp3_path, bitrate=bitrate)
     try:
@@ -187,7 +285,11 @@ def download_audio_via_ytdlp(
     if cookies_from_browser:
         cmd[1:1] = ["--cookies-from-browser", cookies_from_browser]
     logger.info("Running yt-dlp fallback…")
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip().splitlines()
+        useful = "\n".join(details[-8:])
+        raise RuntimeError(f"yt-dlp audio fallback failed:\n{useful}")
 
 
 def resolve_mp3_after_ytdlp(out_mp3: Path) -> Path:
